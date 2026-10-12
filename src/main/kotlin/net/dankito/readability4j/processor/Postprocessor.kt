@@ -27,6 +27,8 @@ open class Postprocessor {
         // Readability cannot open relative uris so we convert them to absolute uris.
         fixRelativeUris(originalDocument, articleContent, articleUri)
 
+        simplifyNestedElements(articleContent)
+
         // Remove IDs and classes.
         // Remove classes.
         val classesToPreserve = Arrays.asList(CLASSES_TO_PRESERVE, additionalClassesToPreserve).flatten().toSet()
@@ -54,7 +56,7 @@ open class Postprocessor {
 
         fixRelativeAnchorUris(element, scheme, prePath, pathBase)
 
-        fixRelativeImageUris(element, scheme, prePath, pathBase)
+        fixRelativeMediaUris(element, scheme, prePath, pathBase)
     }
 
     protected open fun fixRelativeAnchorUris(element: Element, scheme: String, prePath: String, pathBase: String) {
@@ -64,8 +66,18 @@ open class Postprocessor {
                 // Replace links with javascript: URIs with text content, since
                 // they won't work after scripts have been removed from the page.
                 if(href.indexOf("javascript:") == 0) {
-                    val text = TextNode(link.wholeText())
-                    link.replaceWith(text)
+                    if(link.childNodeSize() == 1 && link.childNode(0) is TextNode) {
+                        val text = TextNode(link.wholeText())
+                        link.replaceWith(text)
+                    }
+                    else {
+                        val replacement = Element("span")
+                        ArrayList(link.childNodes()).forEach { child ->
+                            child.remove()
+                            replacement.appendChild(child)
+                        }
+                        link.replaceWith(replacement)
+                    }
                 }
                 else {
                     link.attr("href", toAbsoluteURI(href, scheme, prePath, pathBase))
@@ -74,18 +86,42 @@ open class Postprocessor {
         }
     }
 
-    protected open fun fixRelativeImageUris(element: Element, scheme: String, prePath: String, pathBase: String) {
-        element.getElementsByTag("img").forEach { img ->
-            fixRelativeImageUri(img, scheme, prePath, pathBase)
+    protected open fun fixRelativeMediaUris(element: Element, scheme: String, prePath: String, pathBase: String) {
+        Arrays.asList("img", "picture", "figure", "video", "audio", "source").forEach { tag ->
+            element.getElementsByTag(tag).forEach { media ->
+                fixRelativeMediaUri(media, scheme, prePath, pathBase)
+            }
         }
     }
 
-    protected open fun fixRelativeImageUri(img: Element, scheme: String, prePath: String, pathBase: String) {
-        val src = img.attr("src")
+    protected open fun fixRelativeMediaUri(media: Element, scheme: String, prePath: String, pathBase: String) {
+        val src = media.attr("src")
+        val poster = media.attr("poster")
+        val srcset = media.attr("srcset")
 
         if(src.isNotBlank()) {
-            img.attr("src", toAbsoluteURI(src, scheme, prePath, pathBase))
+            media.attr("src", toAbsoluteURI(src, scheme, prePath, pathBase))
         }
+        if(poster.isNotBlank()) {
+            media.attr("poster", toAbsoluteURI(poster, scheme, prePath, pathBase))
+        }
+        if(srcset.isNotBlank()) {
+            media.attr("srcset", fixSrcset(srcset, scheme, prePath, pathBase))
+        }
+    }
+
+    protected open fun fixSrcset(srcset: String, scheme: String, prePath: String, pathBase: String): String {
+        return srcset.split(",").map { entry ->
+            val trimmed = entry.trim()
+            if(trimmed.isBlank()) {
+                ""
+            }
+            else {
+                val parts = trimmed.split("\\s+".toRegex(), 2)
+                val absolute = toAbsoluteURI(parts[0], scheme, prePath, pathBase)
+                if(parts.size > 1) "$absolute ${parts[1]}" else absolute
+            }
+        }.filter { it.isNotBlank() }.joinToString(", ")
     }
 
     protected open fun toAbsoluteURI(uri: String, scheme: String, prePath: String, pathBase: String): String {
@@ -142,6 +178,73 @@ open class Postprocessor {
         node.children().forEach { child ->
             cleanClasses(child, classesToPreserve)
         }
+    }
+
+    protected open fun simplifyNestedElements(articleContent: Element) {
+        var node: Element? = articleContent
+
+        while(node != null) {
+            if(node.parent() != null &&
+                    (node.tagName() == "div" || node.tagName() == "section") &&
+                    node.id().startsWith("readability") == false) {
+                if(isElementWithoutContent(node)) {
+                    node = removeAndGetNext(node)
+                    continue
+                }
+                else if(hasSingleTagInsideElement(node, "div") || hasSingleTagInsideElement(node, "section")) {
+                    val child = node.child(0)
+                    node.attributes().forEach { attr ->
+                        child.attr(attr.key, attr.value)
+                    }
+                    node.replaceWith(child)
+                    node = child
+                    continue
+                }
+            }
+
+            node = getNextNode(node)
+        }
+    }
+
+    protected open fun hasSingleTagInsideElement(element: Element, tagName: String): Boolean {
+        if(element.children().size != 1 || element.child(0).tagName() != tagName) {
+            return false
+        }
+
+        element.childNodes().forEach { node ->
+            if(node is TextNode && node.text().trim().isNotEmpty()) {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    protected open fun isElementWithoutContent(node: Element): Boolean {
+        return node.text().isBlank() &&
+                (node.children().size == 0 ||
+                        node.children().size == node.getElementsByTag("br").size + node.getElementsByTag("hr").size)
+    }
+
+    protected open fun removeAndGetNext(node: Element): Element? {
+        val nextNode = getNextNode(node, true)
+        node.remove()
+        return nextNode
+    }
+
+    protected open fun getNextNode(node: Element, ignoreSelfAndKids: Boolean = false): Element? {
+        if(ignoreSelfAndKids == false && node.children().size > 0) {
+            return node.child(0)
+        }
+
+        node.nextElementSibling()?.let { return it }
+
+        var parent = node.parent()
+        while(parent != null && parent.nextElementSibling() == null) {
+            parent = parent.parent()
+        }
+
+        return parent?.nextElementSibling()
     }
 
 }

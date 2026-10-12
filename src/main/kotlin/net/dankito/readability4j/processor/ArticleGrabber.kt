@@ -24,7 +24,12 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
         
         val DIV_TO_P_ELEMS = Arrays.asList("a", "blockquote", "dl", "div", "img", "ol", "p", "pre", "table", "ul", "select")
 
-        val ALTER_TO_DIV_EXCEPTIONS = Arrays.asList("div", "article", "section", "p")
+        val PHRASING_ELEMS = setOf("abbr", "audio", "b", "bdo", "br", "button", "cite", "code", "data", "datalist",
+                "dfn", "em", "embed", "i", "img", "input", "kbd", "label", "mark", "math", "meter", "noscript",
+                "object", "output", "progress", "q", "ruby", "samp", "script", "select", "small", "span",
+                "strong", "sub", "sup", "textarea", "time", "var", "wbr")
+
+        val ALTER_TO_DIV_EXCEPTIONS = Arrays.asList("div", "article", "section", "p", "ol", "ul")
 
         val PRESENTATIONAL_ATTRIBUTES = Arrays.asList("align", "background", "bgcolor", "border", "cellpadding", "cellspacing", "frame", "hspace", "rules", "style", "valign", "vspace")
 
@@ -33,6 +38,8 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
         val EMBEDDED_NODES = Arrays.asList("object", "embed", "iframe")
 
         val DATA_TABLE_DESCENDANTS = Arrays.asList("col", "colgroup", "tfoot", "thead", "th")
+
+        val UNLIKELY_ROLES = Arrays.asList("menu", "menubar", "complementary", "navigation", "alert", "alertdialog", "dialog")
 
 
         private val log = LoggerFactory.getLogger(ArticleGrabber::class.java)
@@ -45,9 +52,12 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
     var articleDir: String? = null
         protected set
 
+    var articleLanguage: String? = null
+        protected set
+
 
     protected val nbTopCandidates = options.nbTopCandidates
-    protected val wordThreshold = options.wordThreshold
+    protected val charThreshold = options.wordThreshold
 
     protected val readabilityObjects = HashMap<Element, ReadabilityObject>()
 
@@ -56,6 +66,12 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
 
     open fun grabArticle(doc: Document, metadata: ArticleMetadata, options: ArticleGrabberOptions = ArticleGrabberOptions(), pageElement: Element? = null): Element? {
         log.debug("**** grabArticle ****")
+
+        articleByline = null
+        articleDir = null
+        articleLanguage = null
+        readabilityObjects.clear()
+        readabilityDataTable.clear()
 
         val isPaging = pageElement != null
         val page = pageElement ?: doc.body()
@@ -66,13 +82,14 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             return null
         }
 
-        val pageCacheHtml = doc.html()
+        val pageCacheHtml = page.html()
+        val attempts = ArrayList<Pair<Element, Int>>()
 
         while(true) {
             // First, node prepping. Trash nodes that look cruddy (like ones with the
             // class name "comment", etc), and turn divs into P tags where they have been
             // used inappropriately (as in, where they contain no other block level elements.)
-            val elementsToScore = prepareNodes(doc, options)
+            val elementsToScore = prepareNodes(doc, options, metadata)
 
             /**
              * Loop through all paragraphs, and assign a score to them based on how content-y they look.
@@ -123,7 +140,6 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             log.debug("Article content after paging: {}", articleContent.html())
 
             var parseSuccessful = true
-            val attempts = ArrayList<Pair<Element, Int>>()
 
             // Now that we've gone through the full algorithm, check to see if
             // we got any meaningful content. If we didn't, we may need to re-run
@@ -131,26 +147,25 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             // finding the content, and the sieve approach gives us a higher likelihood of
             // finding the -right- content.
             val textLength = getInnerText(articleContent, regEx, true).length
-            if(textLength < this.wordThreshold) {
+            if(textLength < this.charThreshold) {
                 parseSuccessful = false
                 page.html(pageCacheHtml)
+                attempts.add(Pair(articleContent, textLength))
+                readabilityObjects.clear()
+                readabilityDataTable.clear()
 
                 if(options.stripUnlikelyCandidates) {
                     options.stripUnlikelyCandidates = false
-                    attempts.add(Pair(articleContent, textLength))
                 }
                 else if(options.weightClasses) {
                     options.weightClasses = false
-                    attempts.add(Pair(articleContent, textLength))
                 }
                 else if(options.cleanConditionally) {
                     options.cleanConditionally = false
-                    attempts.add(Pair(articleContent, textLength))
                 }
                 else {
-                    attempts.add(Pair(articleContent, textLength))
                     // No luck after removing flags, just return the longest text we found during the different loops
-                    attempts.sortBy { it.second }
+                    attempts.sortByDescending { it.second }
 
                     // But first check if we actually have something
                     if (attempts.isEmpty() || attempts[0].second <= 0) {
@@ -174,16 +189,37 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
 
     /*             First step: prepare nodes           */
 
-    protected open fun prepareNodes(doc: Document, options: ArticleGrabberOptions): List<Element> {
+    protected open fun prepareNodes(doc: Document, options: ArticleGrabberOptions, metadata: ArticleMetadata): List<Element> {
         val elementsToScore = ArrayList<Element>()
-        var node: Element? = doc
+        var node: Element? = doc.selectFirst("html") ?: doc
+        var shouldRemoveTitleHeader = true
 
         while(node != null) {
+            if(node.tagName() == "html") {
+                articleLanguage = node.attr("lang")
+            }
+
             val matchString = node.className() + " " + node.id()
 
+            if(isProbablyVisible(node) == false) {
+                node = removeAndGetNext(node, "Removing hidden node")
+                continue
+            }
+
+            if(node.attr("aria-modal") == "true" && node.attr("role") == "dialog") {
+                node = removeAndGetNext(node, "Removing dialog")
+                continue
+            }
+
             // Check to see if this node is a byline, and remove it if it is.
-            if(checkByline(node, matchString)) {
+            if(checkByline(node, matchString, metadata.byline)) {
                 node = removeAndGetNext(node, "byline")
+                continue
+            }
+
+            if(shouldRemoveTitleHeader && headerDuplicatesTitle(node, metadata.title ?: doc.title())) {
+                shouldRemoveTitleHeader = false
+                node = removeAndGetNext(node, "title header")
                 continue
             }
 
@@ -191,6 +227,9 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             if(options.stripUnlikelyCandidates) {
                 if(regEx.isUnlikelyCandidate(matchString) &&
                         regEx.okMaybeItsACandidate(matchString) == false &&
+                        hasAncestorTag(node, "table", -1) == false &&
+                        hasAncestorTag(node, "code", -1) == false &&
+                        UNLIKELY_ROLES.contains(node.attr("role")) == false &&
                         node.tagName() != "body" &&
                         node.tagName() != "a") {
                     node = this.removeAndGetNext(node, "Removing unlikely candidate")
@@ -228,15 +267,34 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
                     elementsToScore.add(node)
                 }
                 else {
-                    // EXPERIMENTAL
-                    node.childNodes().forEach { childNode ->
-                        if(childNode is TextNode && childNode.text().trim().length > 0) {
-                            val p = doc.createElement("p")
-                            p.text(childNode.text())
-                            p.attr("style", "display: inline;")
-                            p.addClass("readability-styled")
-                            childNode.replaceWith(p)
+                    var childNode: org.jsoup.nodes.Node? = node.childNode(0)
+                    while(childNode != null) {
+                        var nextSibling = childNode.nextSibling()
+                        if(isPhrasingContent(childNode)) {
+                            val collected = ArrayList<org.jsoup.nodes.Node>()
+                            while(childNode != null && isPhrasingContent(childNode)) {
+                                val current = childNode
+                                childNode = childNode.nextSibling()
+                                current.remove()
+                                collected.add(current)
+                            }
+                            nextSibling = childNode
+
+                            while(collected.isNotEmpty() && isWhitespace(collected.first())) {
+                                collected.removeAt(0)
+                            }
+                            while(collected.isNotEmpty() && isWhitespace(collected.last())) {
+                                collected.removeAt(collected.lastIndex)
+                            }
+
+                            if(collected.isNotEmpty()) {
+                                val p = doc.createElement("p")
+                                collected.forEach { p.appendChild(it) }
+                                node.insertChildren(nextSibling?.siblingIndex() ?: node.childNodeSize(), p)
+                                elementsToScore.add(p)
+                            }
                         }
+                        childNode = nextSibling
                     }
                 }
             }
@@ -248,14 +306,15 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
     }
 
 
-    protected open fun checkByline(node: Element, matchString: String): Boolean {
-        if(this.articleByline != null) {
+    protected open fun checkByline(node: Element, matchString: String, metadataByline: String? = null): Boolean {
+        if(this.articleByline != null || metadataByline.isNullOrBlank() == false) {
             return false
         }
 
         val rel = node.attr("rel")
+        val itemProp = node.attr("itemprop")
 
-        if((rel == "author" || regEx.isByline(matchString)) && isValidByline(node.wholeText())) {
+        if((rel == "author" || itemProp.contains("author") || regEx.isByline(matchString)) && isValidByline(node.wholeText())) {
             this.articleByline = node.text().trim()
             return true
         }
@@ -293,7 +352,25 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             return false
         }
 
+        if(getLinkDensity(element) >= 0.25) {
+            return false
+        }
+
         // And there should be no text nodes with real content
+        element.childNodes().forEach { node ->
+            if(node is TextNode && regEx.hasContent(node.text())) {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    protected open fun hasSingleTagInsideElement(element: Element, tagName: String): Boolean {
+        if(element.children().size != 1 || element.child(0).tagName() != tagName) {
+            return false
+        }
+
         element.childNodes().forEach { node ->
             if(node is TextNode && regEx.hasContent(node.text())) {
                 return false
@@ -339,7 +416,7 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             }
 
             // Exclude nodes with no ancestor.
-            val ancestors = this.getNodeAncestors(elementToScore, 3)
+            val ancestors = this.getNodeAncestors(elementToScore, 5)
             if(ancestors.size == 0) {
                 return@forEach
             }
@@ -350,7 +427,7 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             contentScore += 1
 
             // Add points for any commas within this paragraph.
-            contentScore += innerText.split(',').size
+            contentScore += innerText.split("[,\\u060C\\uFE50\\uFE10\\uFE11\\u2E41\\u2E34\\u2E32\\uFF0C]".toRegex()).size
 
             // For every 100 characters in this paragraph, add another point. Up to 3 points.
             contentScore += Math.min(Math.floor(innerText.length / 100.0), 3.0)
@@ -644,7 +721,9 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
 
         // XXX implement _reduceNodeList?
         element.getElementsByTag("a").forEach { linkNode ->
-            linkLength += this.getInnerText(linkNode, regEx).length
+            val href = linkNode.attr("href")
+            val coefficient = if(href.startsWith("#")) 0.3 else 1.0
+            linkLength += (this.getInnerText(linkNode, regEx).length * coefficient).toInt()
         }
 
         return linkLength / textLength.toDouble()
@@ -751,37 +830,14 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
         this.clean(articleContent, "embed")
         this.clean(articleContent, "footer")
         this.clean(articleContent, "link")
+        this.clean(articleContent, "aside")
 
         // Clean out elements have "share" in their id/class combinations from final top candidates,
         // which means we don't remove the top candidates even they have "share".
         val shareRegex = "share".toRegex()
+        val shareElementThreshold = charThreshold
         articleContent.children().forEach { topCandidate ->
-            cleanMatchedNodes(topCandidate, shareRegex)
-        }
-
-        // If there is only one h2 and its text content substantially equals article title,
-        // they are probably using it as a header and not a subheader,
-        // so remove it since we already extract the title separately.
-        val h2 = articleContent.getElementsByTag("h2")
-        if (h2.size == 1) {
-            metadata.title?.let { articleTitle ->
-                if(articleTitle.length > 0) {
-                    val lengthSimilarRate = (h2[0].text().length - articleTitle.length) / articleTitle.length.toFloat()
-                    if (Math.abs(lengthSimilarRate) < 0.5) {
-                        val titlesMatch =
-                            if(lengthSimilarRate > 0) {
-                                h2[0].text().contains(articleTitle)
-                            }
-                            else {
-                                articleTitle.contains(h2[0].text())
-                            }
-
-                        if(titlesMatch) {
-                            this.clean(articleContent, "h2")
-                        }
-                    }
-                }
-            }
+            cleanMatchedNodes(topCandidate, shareRegex, shareElementThreshold)
         }
 
         this.clean(articleContent, "iframe")
@@ -796,6 +852,10 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
         this.cleanConditionally(articleContent, "table", options)
         this.cleanConditionally(articleContent, "ul", options)
         this.cleanConditionally(articleContent, "div", options)
+
+        articleContent.getElementsByTag("h1").forEach {
+            setNodeTag(it, "h2")
+        }
 
         // Remove extra paragraphs
         removeNodes(articleContent, "p") { paragraph ->
@@ -815,6 +875,8 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
                 br.remove()
             }
         }
+
+        removeSingleCellTables(articleContent)
     }
 
     /**
@@ -883,6 +945,10 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             }
 
             val sizeInfo = getRowAndColumnCount(table)
+            if(sizeInfo.first == 1 || sizeInfo.second == 1) {
+                setReadabilityDataTable(table, false)
+                return@outer
+            }
             if (sizeInfo.first >= 10 || sizeInfo.second > 4) {
                 setReadabilityDataTable(table, true)
                 return@outer
@@ -946,6 +1012,12 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             if(hasAncestorTag(node, "table", -1, isDataTable)) {
                 return@removeNodes false
             }
+            if(hasAncestorTag(node, "code", -1)) {
+                return@removeNodes false
+            }
+            if(node.getElementsByTag("table").any { getReadabilityDataTable(it) }) {
+                return@removeNodes false
+            }
 
             val weight = getClassWeight(node, options)
             val contentScore = 0
@@ -964,25 +1036,49 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
                 val img = node.getElementsByTag("img").size
                 val li = node.getElementsByTag("li").size - 100
                 val input = node.getElementsByTag("input").size
+                val headingDensity = getTextDensity(node, listOf("h1", "h2", "h3", "h4", "h5", "h6"))
 
                 var embedCount = 0
-                node.getElementsByTag("embed").forEach {
-                    if(regEx.isVideo(it.attr("src")) == false) {
-                        embedCount += 1
+                node.select("embed,object,iframe").forEach {
+                    val attributeValues = it.attributes().map { attr -> attr.value }.joinToString("|")
+                    if(regEx.isVideo(attributeValues) == false && (it.tagName() != "object" || regEx.isVideo(it.html()) == false)) {
+                        embedCount++
+                    }
+                    else {
+                        return@removeNodes false
                     }
                 }
 
+                val innerText = getInnerText(node, regEx)
+                if(innerText.matches("^(ad(vertising|vertisement)?|pub(licité)?|werb(ung)?|广告|Реклама|Anuncio)$".toRegex(RegexOption.IGNORE_CASE)) ||
+                        innerText.matches("^((loading|正在加载|Загрузка|chargement|cargando)(…|\\.\\.\\.)?)$".toRegex(RegexOption.IGNORE_CASE))) {
+                    return@removeNodes true
+                }
+
                 val linkDensity = getLinkDensity(node)
-                val contentLength = getInnerText(node, regEx).length
+                val contentLength = innerText.length
+                val textDensity = getTextDensity(node, listOf("span", "li", "td") + DIV_TO_P_ELEMS)
+                val isFigureChild = hasAncestorTag(node, "figure", -1)
 
                 val haveToRemove =
-                        (img > 1 && p / img.toFloat() < 0.5 && !hasAncestorTag(node, "figure")) ||
+                        (!isFigureChild && img > 1 && p / img.toFloat() < 0.5) ||
                                 (!isList && li > p) ||
                                 (input > Math.floor(p/3.0)) ||
-                                (!isList && contentLength < 25 && img == 0 && !hasAncestorTag(node, "figure")) ||
-                                (!isList && weight < 25 && linkDensity > 0.2) ||
-                                (weight >= 25 && linkDensity > 0.5) ||
-                                ((embedCount == 1 && contentLength < 75) || embedCount > 1)
+                                (!isList && !isFigureChild && headingDensity < 0.9 && contentLength < 25 && (img == 0 || img > 2) && linkDensity > 0) ||
+                                (!isList && weight < 25 && linkDensity > 0.2 + this.options.linkDensityModifier) ||
+                                (weight >= 25 && linkDensity > 0.5 + this.options.linkDensityModifier) ||
+                                ((embedCount == 1 && contentLength < 75) || embedCount > 1) ||
+                                (img == 0 && textDensity == 0.0)
+
+                if(isList && haveToRemove) {
+                    if(node.children().all { it.children().size <= 1 }) {
+                        val liCount = node.getElementsByTag("li").size
+                        if(liCount > 0 && liCount == img) {
+                            return@removeNodes false
+                        }
+                    }
+                }
+
                 return@removeNodes haveToRemove
             }
 
@@ -1052,12 +1148,12 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
     /**
      * Clean out elements whose id/class combinations match specific string.
      */
-    protected open fun cleanMatchedNodes(e: Element, regex: Regex) {
+    protected open fun cleanMatchedNodes(e: Element, regex: Regex, minimumTextLength: Int = 0) {
         val endOfSearchMarkerNode = getNextNode(e, true)
         var next = getNextNode(e)
 
         while(next != null && next != endOfSearchMarkerNode) {
-            if(regex.containsMatchIn(next.className() + " " + next.id())) {
+            if(regex.containsMatchIn(next.className() + " " + next.id()) && next.text().length < minimumTextLength) {
                 next = removeAndGetNext(next, regex.pattern)
             }
             else {
@@ -1075,6 +1171,105 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
                 getClassWeight(header, options) < 0
             }
         }
+    }
+
+    protected open fun removeSingleCellTables(articleContent: Element) {
+        articleContent.getElementsByTag("table").forEach { table ->
+            val tbody = if(hasSingleTagInsideElement(table, "tbody")) table.child(0) else table
+            if(hasSingleTagInsideElement(tbody, "tr")) {
+                val row = tbody.child(0)
+                if(hasSingleTagInsideElement(row, "td")) {
+                    val cell = row.child(0)
+                    val newTag = if(cell.childNodes().all { isPhrasingContent(it) }) "p" else "div"
+                    setNodeTag(cell, newTag)
+                    table.replaceWith(cell)
+                }
+            }
+        }
+    }
+
+    protected open fun getTextDensity(element: Element, tags: List<String>): Double {
+        val textLength = getInnerText(element, regEx, true).length
+        if(textLength == 0) {
+            return 0.0
+        }
+
+        var childrenLength = 0
+        tags.forEach { tag ->
+            element.getElementsByTag(tag).forEach { child ->
+                childrenLength += getInnerText(child, regEx, true).length
+            }
+        }
+
+        return childrenLength / textLength.toDouble()
+    }
+
+    protected open fun isProbablyVisible(node: Element): Boolean {
+        val style = node.attr("style").toLowerCase()
+        if(style.contains("display:none") || style.contains("visibility:hidden")) {
+            return false
+        }
+        if(node.hasAttr("hidden")) {
+            return false
+        }
+        if(node.attr("aria-hidden") == "true" && node.className().contains("fallback-image") == false) {
+            return false
+        }
+
+        return true
+    }
+
+    protected open fun headerDuplicatesTitle(node: Element, articleTitle: String): Boolean {
+        if(node.tagName() != "h1" && node.tagName() != "h2") {
+            return false
+        }
+
+        val title = articleTitle.trim()
+        if(title.isBlank()) {
+            return false
+        }
+
+        return textSimilarity(title, getInnerText(node, regEx, false)) > 0.75
+    }
+
+    protected open fun textSimilarity(textA: String, textB: String): Double {
+        val tokensA = textA.toLowerCase().split("\\W+".toRegex()).filter { it.isNotBlank() }
+        val tokensB = textB.toLowerCase().split("\\W+".toRegex()).filter { it.isNotBlank() }
+        if(tokensA.isEmpty() || tokensB.isEmpty()) {
+            return 0.0
+        }
+
+        val uniqueTokensInB = tokensB.filter { tokensA.contains(it) == false }
+        val tokensBLength = tokensB.joinToString(" ").length
+        if(tokensBLength == 0) {
+            return 0.0
+        }
+        val distance = uniqueTokensInB.joinToString(" ").length / tokensBLength.toDouble()
+        return 1.0 - distance
+    }
+
+    protected open fun isPhrasingContent(node: org.jsoup.nodes.Node): Boolean {
+        if(node is TextNode) {
+            return true
+        }
+
+        if(node is Element == false) {
+            return false
+        }
+
+        if(PHRASING_ELEMS.contains(node.tagName())) {
+            return true
+        }
+
+        if(node.tagName() == "a" || node.tagName() == "del" || node.tagName() == "ins") {
+            return node.childNodes().all { isPhrasingContent(it) }
+        }
+
+        return false
+    }
+
+    protected open fun isWhitespace(node: org.jsoup.nodes.Node): Boolean {
+        return (node is TextNode && node.text().trim().isEmpty()) || (node is Element && node.tagName() == "br")
     }
 
 

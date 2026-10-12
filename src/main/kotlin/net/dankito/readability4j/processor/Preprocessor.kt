@@ -1,9 +1,11 @@
 package net.dankito.readability4j.processor
 
 import net.dankito.readability4j.util.RegExUtil
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
+import org.jsoup.nodes.TextNode
 import org.slf4j.LoggerFactory
 
 /**
@@ -18,71 +20,106 @@ open class Preprocessor(protected val regEx: RegExUtil = RegExUtil()) : Processo
 
     /**
      * Prepare the HTML document for readability to scrape it.
-     * This includes things like stripping javascript, CSS, and handling terrible markup.
+     * This includes things like stripping CSS, replacing BR chains and handling font tags.
      */
     open fun prepareDocument(document: Document) {
         log.debug("Starting to prepare document")
 
-        removeScripts(document)
-        removeNoscripts(document);
-
         removeStyles(document)
-
-        removeForms(document) // TODO: this is not in Mozilla's Readability
-
-        removeComments(document) // TODO: this is not in Mozilla's Readability
 
         replaceBrs(document, regEx)
 
         replaceNodes(document, "font", "span")
     }
 
+    open fun unwrapNoscriptImages(document: Document) {
+        removePlaceholderImagesWithoutSource(document)
 
-    protected open fun removeScripts(document: Document) {
-        removeNodes(document, "script") { scriptNode ->
-            scriptNode.`val`(null) // TODO: what is this good for?
-            scriptNode.removeAttr("src")
-            true
-        }
-    }
-
-    protected open fun removeNoscripts(document: Document) {
         document.getElementsByTag("noscript").forEach { noscript ->
-            if(shouldKeepImageInNoscriptElement(document, noscript)) { // TODO: this is not in Mozilla's Readability
-                noscript.unwrap()
+            if(isSingleImage(noscript) == false) {
+                return@forEach
             }
-            else {
-                printAndRemove(noscript, "removeScripts('noscript')")
+
+            val tmp = document.createElement("div")
+            tmp.html(noscript.html())
+            val newImage = tmp.selectFirst("img") ?: return@forEach
+
+            val previousElement = noscript.previousElementSibling() ?: return@forEach
+            if(isSingleImage(previousElement) == false) {
+                return@forEach
             }
-        }
-    }
 
-    protected open fun shouldKeepImageInNoscriptElement(document: Document, noscript: Element): Boolean {
-        val images = noscript.select("img")
-        if(images.size > 0) {
-            val imagesToKeep = ArrayList(images)
+            val previousImage = if(previousElement.tagName() == "img") previousElement else previousElement.selectFirst("img")
+                    ?: return@forEach
 
-            images.forEach { image ->
-                // thanks to swuqi (https://github.com/swuqi) for reporting this bug.
-                // see https://github.com/dankito/Readability4J/issues/4
-                val source = image.attr("src")
-                if(source.isNotBlank() && document.select("img[src=$source]").size > 0) {
-                    imagesToKeep.remove(image)
+            previousImage.attributes().forEach { attribute ->
+                val attributeValue = attribute.value.trim()
+                if(attributeValue.isBlank()) {
+                    return@forEach
+                }
+
+                if(attribute.key == "src" || attribute.key == "srcset" || attributeValue.contains("\\.(jpg|jpeg|png|webp)".toRegex(RegexOption.IGNORE_CASE))) {
+                    if(newImage.attr(attribute.key) == attributeValue) {
+                        return@forEach
+                    }
+
+                    val attributeName = if(newImage.hasAttr(attribute.key)) "data-old-${attribute.key}" else attribute.key
+                    newImage.attr(attributeName, attributeValue)
                 }
             }
 
-            return imagesToKeep.size > 0
+            previousElement.replaceWith(newImage)
+        }
+    }
+
+    open fun removeScriptsAndNoscripts(document: Document) {
+        removeNodes(document, "script")
+        removeNodes(document, "noscript")
+    }
+
+
+    protected open fun removePlaceholderImagesWithoutSource(document: Document) {
+        document.getElementsByTag("img").forEach { image ->
+            var shouldKeep = false
+
+            image.attributes().forEach { attribute ->
+                when(attribute.key) {
+                    "src", "srcset", "data-src", "data-srcset" -> shouldKeep = true
+                    else -> {
+                        if(attribute.value.contains("\\.(jpg|jpeg|png|webp)".toRegex(RegexOption.IGNORE_CASE))) {
+                            shouldKeep = true
+                        }
+                    }
+                }
+            }
+
+            if(shouldKeep == false) {
+                image.remove()
+            }
+        }
+    }
+
+    protected open fun isSingleImage(node: Element?): Boolean {
+        var current = node
+
+        while(current != null) {
+            if(current.tagName() == "img") {
+                return true
+            }
+
+            if(current.children().size != 1 || current.text().trim().isNotEmpty()) {
+                return false
+            }
+
+            current = current.child(0)
         }
 
         return false
     }
 
+
     protected open fun removeStyles(document: Document) {
         removeNodes(document, "style")
-    }
-
-    protected open fun removeForms(document: Document) {
-        removeNodes(document, "form")
     }
 
     protected open fun removeComments(node: Node) {
@@ -142,13 +179,56 @@ open class Preprocessor(protected val regEx: RegExUtil = RegExUtil()) : Processo
                             break
                     }
 
+                    if(isPhrasingContent(next) == false) {
+                        break
+                    }
+
                     // Otherwise, make this node a child of the new <p>.
                     val sibling = next.nextSibling()
                     p.appendChild(next)
                     next = sibling
                 }
+
+                while(p.childNodeSize() > 0 && isWhitespace(p.childNode(p.childNodeSize() - 1))) {
+                    p.childNode(p.childNodeSize() - 1).remove()
+                }
+
+                if(p.parent()?.tagName() == "p") {
+                    p.parent()?.tagName("div")
+                }
             }
         }
+    }
+
+    protected open fun isPhrasingContent(node: Node): Boolean {
+        if(node is TextNode) {
+            return true
+        }
+
+        if(node is Element == false) {
+            return false
+        }
+
+        val phrasingElements = setOf(
+                "abbr", "audio", "b", "bdo", "br", "button", "cite", "code", "data", "datalist", "dfn",
+                "em", "embed", "i", "img", "input", "kbd", "label", "mark", "math", "meter", "noscript",
+                "object", "output", "progress", "q", "ruby", "samp", "script", "select", "small", "span",
+                "strong", "sub", "sup", "textarea", "time", "var", "wbr"
+        )
+
+        return if(phrasingElements.contains(node.tagName())) {
+            true
+        }
+        else if(node.tagName() == "a" || node.tagName() == "del" || node.tagName() == "ins") {
+            node.childNodes().all { isPhrasingContent(it) }
+        }
+        else {
+            false
+        }
+    }
+
+    protected open fun isWhitespace(node: Node): Boolean {
+        return (node is TextNode && node.text().trim().isEmpty()) || (node is Element && node.tagName() == "br")
     }
 
 }
