@@ -95,10 +95,9 @@ open class Readability4J {
         val article = Article(uri)
 
         preprocessor.unwrapNoscriptImages(document)
-
         val jsonLdMetadata = metadataParser.getJsonLdArticleMetadata(document)
-
         preprocessor.removeScriptsAndNoscripts(document)
+
         preprocessor.prepareDocument(document)
 
         val metadata = metadataParser.getArticleMetadata(document, jsonLdMetadata)
@@ -130,7 +129,6 @@ open class Readability4J {
         article.title = metadata.title
         article.byline = if(metadata.byline.isNullOrBlank()) articleGrabber.articleByline else metadata.byline
         article.dir = articleGrabber.articleDir
-        article.language = articleGrabber.articleLanguage
         article.excerpt = metadata.excerpt
         article.charset = metadata.charset
         article.siteName = metadata.siteName

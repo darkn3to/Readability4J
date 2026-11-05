@@ -4,7 +4,6 @@ package net.dankito.readability4j.model
 open class ReadabilityOptions(val maxElemsToParse: Int = DEFAULT_MAX_ELEMS_TO_PARSE,
                               val nbTopCandidates: Int = DEFAULT_N_TOP_CANDIDATES,
                               val wordThreshold: Int = DEFAULT_WORD_THRESHOLD,
-                              val linkDensityModifier: Double = DEFAULT_LINK_DENSITY_MODIFIER,
                               val additionalClassesToPreserve: Collection<String> = ArrayList()) {
 
     companion object {
@@ -17,8 +16,6 @@ open class ReadabilityOptions(val maxElemsToParse: Int = DEFAULT_MAX_ELEMS_TO_PA
 
         // The default number of words an article must have in order to return a result
         const val DEFAULT_WORD_THRESHOLD = 500
-
-        const val DEFAULT_LINK_DENSITY_MODIFIER = 0.0
     }
 
 }
