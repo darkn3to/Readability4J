@@ -79,6 +79,10 @@ open class Article(
          */
         var charset: String? = null
 
+        var siteName: String? = null
+
+        var publishedTime: String? = null
+
 
         /**
          * [content] returns a &lt;div> element.

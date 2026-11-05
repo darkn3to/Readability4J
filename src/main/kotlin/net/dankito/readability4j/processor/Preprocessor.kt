@@ -1,6 +1,7 @@
 package net.dankito.readability4j.processor
 
 import net.dankito.readability4j.util.RegExUtil
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
@@ -23,9 +24,6 @@ open class Preprocessor(protected val regEx: RegExUtil = RegExUtil()) : Processo
     open fun prepareDocument(document: Document) {
         log.debug("Starting to prepare document")
 
-        removeScripts(document)
-        removeNoscripts(document);
-
         removeStyles(document)
 
         removeForms(document) // TODO: this is not in Mozilla's Readability
@@ -35,6 +33,34 @@ open class Preprocessor(protected val regEx: RegExUtil = RegExUtil()) : Processo
         replaceBrs(document, regEx)
 
         replaceNodes(document, "font", "span")
+    }
+
+    open fun unwrapNoscriptImages(document: Document) {
+        document.getElementsByTag("noscript").forEach { noscript ->
+            val parsedNoscript = Jsoup.parse(noscript.html())
+            val newImage = parsedNoscript.selectFirst("img") ?: return@forEach
+
+            val previousElement = noscript.previousElementSibling() ?: return@forEach
+            if(previousElement.tagName() != "img") {
+                return@forEach
+            }
+
+            val previousSrc = previousElement.attr("src")
+            if(previousSrc.isNotBlank()) {
+                return@forEach
+            }
+
+            if(previousElement.attr("srcset").isNotBlank()) {
+                newImage.attr("data-old-srcset", previousElement.attr("srcset"))
+            }
+
+            previousElement.replaceWith(newImage)
+        }
+    }
+
+    open fun removeScriptsAndNoscripts(document: Document) {
+        removeScripts(document)
+        removeNoscripts(document)
     }
 
 

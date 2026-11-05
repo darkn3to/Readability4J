@@ -66,7 +66,8 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             return null
         }
 
-        val pageCacheHtml = doc.html()
+        val pageCacheHtml = page.html()
+        val attempts = ArrayList<Pair<Element, Int>>()
 
         while(true) {
             // First, node prepping. Trash nodes that look cruddy (like ones with the
@@ -123,7 +124,6 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
             log.debug("Article content after paging: {}", articleContent.html())
 
             var parseSuccessful = true
-            val attempts = ArrayList<Pair<Element, Int>>()
 
             // Now that we've gone through the full algorithm, check to see if
             // we got any meaningful content. If we didn't, we may need to re-run
@@ -135,22 +135,20 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
                 parseSuccessful = false
                 page.html(pageCacheHtml)
 
+                attempts.add(Pair(articleContent, textLength))
+
                 if(options.stripUnlikelyCandidates) {
                     options.stripUnlikelyCandidates = false
-                    attempts.add(Pair(articleContent, textLength))
                 }
                 else if(options.weightClasses) {
                     options.weightClasses = false
-                    attempts.add(Pair(articleContent, textLength))
                 }
                 else if(options.cleanConditionally) {
                     options.cleanConditionally = false
-                    attempts.add(Pair(articleContent, textLength))
                 }
                 else {
-                    attempts.add(Pair(articleContent, textLength))
                     // No luck after removing flags, just return the longest text we found during the different loops
-                    attempts.sortBy { it.second }
+                    attempts.sortByDescending { it.second }
 
                     // But first check if we actually have something
                     if (attempts.isEmpty() || attempts[0].second <= 0) {
@@ -255,7 +253,9 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
 
         val rel = node.attr("rel")
 
-        if((rel == "author" || regEx.isByline(matchString)) && isValidByline(node.wholeText())) {
+        val itemProp = node.attr("itemprop")
+
+        if((rel == "author" || itemProp.contains("author") || regEx.isByline(matchString)) && isValidByline(node.wholeText())) {
             this.articleByline = node.text().trim()
             return true
         }
@@ -644,7 +644,8 @@ open class ArticleGrabber(protected val options: ReadabilityOptions, protected v
 
         // XXX implement _reduceNodeList?
         element.getElementsByTag("a").forEach { linkNode ->
-            linkLength += this.getInnerText(linkNode, regEx).length
+            val coefficient = if(linkNode.attr("href").startsWith("#")) 0.3 else 1.0
+            linkLength += (this.getInnerText(linkNode, regEx).length * coefficient).toInt()
         }
 
         return linkLength / textLength.toDouble()

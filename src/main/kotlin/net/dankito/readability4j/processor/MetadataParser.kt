@@ -3,61 +3,105 @@ package net.dankito.readability4j.processor
 import net.dankito.readability4j.model.ArticleMetadata
 import net.dankito.readability4j.util.RegExUtil
 import org.jsoup.nodes.Document
+import org.jsoup.parser.Parser
 import java.util.regex.Pattern
 
 
 open class MetadataParser(protected val regEx: RegExUtil = RegExUtil()): ProcessorBase() {
 
+    open fun getJsonLdArticleMetadata(document: Document): ArticleMetadata {
+        val metadata = ArticleMetadata()
 
-    open fun getArticleMetadata(document: Document): ArticleMetadata {
+        document.select("script[type=application/ld+json]").forEach { script ->
+            val content = script.data().ifBlank { script.html() }
+
+            extractJsonStringValue(content, "headline")?.let { if(metadata.title == null) metadata.title = it }
+            extractJsonStringValue(content, "description")?.let { if(metadata.excerpt == null) metadata.excerpt = it }
+            extractJsonStringValue(content, "datePublished")?.let { metadata.publishedTime = it }
+            extractNestedJsonStringValue(content, "publisher", "name")?.let { metadata.siteName = it }
+
+            extractNestedJsonStringValue(content, "author", "name")?.let { if(metadata.byline == null) metadata.byline = it }
+        }
+
+        metadata.title = unescapeHtmlEntities(metadata.title)
+        metadata.byline = unescapeHtmlEntities(metadata.byline)
+        metadata.excerpt = unescapeHtmlEntities(metadata.excerpt)
+        metadata.siteName = unescapeHtmlEntities(metadata.siteName)
+
+        return metadata
+    }
+
+
+    open fun getArticleMetadata(document: Document, jsonLdMetadata: ArticleMetadata = ArticleMetadata()): ArticleMetadata {
         val metadata = ArticleMetadata()
         val values = HashMap<String, String>()
 
-        // Match "description", or Twitter's "twitter:description" (Cards)
-        // in name attribute.
-        val namePattern = Pattern.compile("^\\s*((twitter)\\s*:\\s*)?(description|title)\\s*$", Pattern.CASE_INSENSITIVE)
+        // Match "description", or Twitter's "twitter:description" (Cards) in name attribute.
+        val namePattern = Pattern.compile("^\\s*(?:(dc|dcterm|og|twitter|parsely|weibo:(article|webpage))\\s*[-\\.:]\\s*)?(author|creator|pub-date|description|title|site_name)\\s*$", Pattern.CASE_INSENSITIVE)
 
-        // Match Facebook's Open Graph title & description properties.
-        val propertyPattern = Pattern.compile("^\\s*og\\s*:\\s*(description|title)\\s*$", Pattern.CASE_INSENSITIVE)
+        // Match Open Graph / dc / article properties.
+        val propertyPattern = Pattern.compile("\\s*(article|dc|dcterm|og|twitter)\\s*:\\s*(author|creator|description|published_time|title|site_name)\\s*", Pattern.CASE_INSENSITIVE)
 
         document.select("meta").forEach { element ->
             val elementName = element.attr("name")
             val elementProperty = element.attr("property")
 
-            if(elementName == "author" || elementProperty == "author") {
-                metadata.byline = element.attr("content")
-                return@forEach
-            }
-
             var name: String? = null
-            if(namePattern.matcher(elementName).find()) {
-                name = elementName
-            }
-            else if(propertyPattern.matcher(elementProperty).find()) {
-                name = elementProperty
+            if(elementProperty.isNotBlank() && propertyPattern.matcher(elementProperty).find()) {
+                name = elementProperty.toLowerCase().replace("\\s".toRegex(), "")
+            } else if(namePattern.matcher(elementName).find()) {
+                name = elementName.toLowerCase().replace("\\s".toRegex(), "").replace(".", ":")
             }
 
             if(name != null) {
                 val content = element.attr("content")
                 if(content.isNullOrBlank() == false) {
-                    // Convert to lowercase and remove any whitespace
-                    // so we can match below.
-                    name = name.toLowerCase().replace("\\s".toRegex(), "")
                     values[name] = content.trim().replace("  ", " ")
                 }
             }
         }
 
         metadata.excerpt = values["description"] ?:
-                           values["og:description"] ?: // Use facebook open graph description.
-                           values["twitter:description"] // Use twitter cards description.
+                values["og:description"] ?:
+                values["twitter:description"] ?:
+                values["dc:description"] ?:
+                values["dcterm:description"] ?:
+                values["weibo:article:description"] ?:
+                values["weibo:webpage:description"] ?:
+                jsonLdMetadata.excerpt
 
         metadata.title = getArticleTitle(document)
         if(metadata.title.isNullOrBlank()) {
-            metadata.title = values["og:title"] ?: // Use facebook open graph title.
-                            values["twitter:title"] // Use twitter cards title.
-                            ?: ""
+            metadata.title = values["og:title"] ?:
+                    values["twitter:title"] ?:
+                    values["dc:title"] ?:
+                    values["dcterm:title"] ?:
+                    values["weibo:article:title"] ?:
+                    values["weibo:webpage:title"] ?:
+                    values["title"] ?:
+                    values["parsely-title"] ?:
+                    jsonLdMetadata.title ?:
+                    ""
         }
+
+        if(metadata.byline.isNullOrBlank()) {
+            val articleAuthor = values["article:author"]?.let { if(it.startsWith("http://") || it.startsWith("https://")) null else it }
+            metadata.byline = values["author"] ?:
+                    values["dc:creator"] ?:
+                    values["dcterm:creator"] ?:
+                    values["parsely-author"] ?:
+                    articleAuthor ?:
+                    jsonLdMetadata.byline
+        }
+
+        metadata.siteName = jsonLdMetadata.siteName ?: values["og:site_name"]
+        metadata.publishedTime = jsonLdMetadata.publishedTime ?: values["article:published_time"] ?: values["parsely-pub-date"]
+
+        metadata.title = unescapeHtmlEntities(metadata.title)
+        metadata.byline = unescapeHtmlEntities(metadata.byline)
+        metadata.excerpt = unescapeHtmlEntities(metadata.excerpt)
+        metadata.siteName = unescapeHtmlEntities(metadata.siteName)
+        metadata.publishedTime = unescapeHtmlEntities(metadata.publishedTime)
 
         metadata.charset = document.charset()?.name()
 
@@ -139,6 +183,24 @@ open class MetadataParser(protected val regEx: RegExUtil = RegExUtil()): Process
 
     protected open fun wordCount(str: String): Int {
         return str.split("\\s+".toRegex()).size
+    }
+
+    protected open fun extractJsonStringValue(json: String, key: String): String? {
+        val matcher = Pattern.compile("\"$key\"\\s*:\\s*\"(.*?)\"", Pattern.DOTALL).matcher(json)
+        return if(matcher.find()) matcher.group(1).trim() else null
+    }
+
+    protected open fun extractNestedJsonStringValue(json: String, objectKey: String, key: String): String? {
+        val objectMatcher = Pattern.compile("\"$objectKey\"\\s*:\\s*\\{(.*?)\\}", Pattern.DOTALL).matcher(json)
+        if(objectMatcher.find() == false) {
+            return null
+        }
+
+        return extractJsonStringValue(objectMatcher.group(1), key)
+    }
+
+    protected open fun unescapeHtmlEntities(value: String?): String? {
+        return value?.let { Parser.unescapeEntities(it, false) }
     }
 
 }
