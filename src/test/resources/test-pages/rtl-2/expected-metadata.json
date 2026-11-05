@@ -2,5 +2,8 @@
   "title" : "RTL Test",
   "byline" : null,
   "excerpt" : "Lorem ipsum dolor sit amet.",
-  "dir" : "rtl"
+  "dir" : "rtl",
+  "charset" : null,
+  "siteName" : null,
+  "publishedTime" : null
 }
